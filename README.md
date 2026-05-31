@@ -8,11 +8,11 @@ And you can run it in real time!!!
 
 ## 🎬 Preview
 
-https://github.com/user-attachments/assets/preview1.mp4
+<video src="https://github.com/user-attachments/assets/REPLACE_WITH_PREVIEW1_URL.mp4" controls="controls" width="100%"></video>
 
 > **Terrain Lighting** — Real-time light variation across the generated terrain
 
-https://github.com/user-attachments/assets/preview2.mp4
+<video src="https://github.com/user-attachments/assets/REPLACE_WITH_PREVIEW2_URL.mp4" controls="controls" width="100%"></video>
 
 > **Terrain Overview** — Full landscape traversal of the procedurally generated world
 
