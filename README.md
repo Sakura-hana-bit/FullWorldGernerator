@@ -2,6 +2,8 @@
 
 A **GPU-accelerated procedural terrain generation system** for Unity (HDRP), featuring composable height layers, biome classification, automatic Unity Terrain output, and an in-editor brush painting pipeline.
 
+And you can run it in real time!!! 
+
 ---
 
 ## ✨ Features
@@ -205,19 +207,10 @@ Assets/Full World Generator/
 ## 📋 Requirements
 
 - **Unity** 2021.2+ (UI Toolkit, Shader Graph)
-- **HDRP** 12+ (project uses HDRP/TerrainLit)
+- **HDRP** 12+ (project uses HDRP/TerrainLit（can Replaced）)
 - **Unity.Mathematics**
 
 ---
 
-## 📄 License
-
-<!-- Add your license here, e.g.: -->
-<!-- MIT License — see [LICENSE](LICENSE) for details. -->
-
----
-
 ## 🙏 Acknowledgements
-
-- GPU brush engine inspired by Unity's GPU-driven painting workflows
 - Erosion simulation based on hydraulic/thermal erosion research
