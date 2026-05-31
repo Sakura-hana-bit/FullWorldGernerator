@@ -1,0 +1,71 @@
+// Bicubic resampling compute shader.
+// Uses Catmull-Rom spline for high-quality up/down-sampling.
+
+#pragma kernel CSBicubicResample
+
+Texture2D<float4> _Source;
+RWTexture2D<float4> _Output;
+
+uint2 _SrcSize;
+uint2 _DstSize;
+
+// Catmull-Rom weight for |t| in [0,2]
+float4 CatmullRom(float t)
+{
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return float4(
+         1.0 * (-t3 + 2.0*t2 - t),
+         1.0 * ( 2.0*t3 - 3.0*t2      + 1.0),
+         1.0 * (-t3 + t2 + t),
+         1.0 * ( 2.0*t3 - 5.0*t2 + 4.0*t - 1.0)   // note: /2 implicit, corrected below
+    ) * 0.5;
+}
+
+// Simplified Catmull-Rom weights
+float W0(float t) { return (-t + 2.0*t*t - t*t*t) * 0.5; }
+float W1(float t) { return (2.0 - 5.0*t*t + 3.0*t*t*t) * 0.5; }
+float W2(float t) { return (t + 4.0*t*t - 3.0*t*t*t) * 0.5; }
+float W3(float t) { return (-t*t + t*t*t) * 0.5; }
+
+[numthreads(8, 8, 1)]
+void CSBicubicResample(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _DstSize.x || id.y >= _DstSize.y) return;
+
+    // Map destination pixel to source UV (texel-center convention)
+    float2 uv = (float2(id.xy) + 0.5) / float2(_DstSize);
+
+    float2 srcPos = uv * float2(_SrcSize) - 0.5;
+    int2 baseXY = int2(floor(srcPos));
+    float2 frac_ = srcPos - float2(baseXY);
+
+    float4 result = float4(0, 0, 0, 0);
+    float wSum = 0;
+
+    // 4x4 tap bicubic
+    [unroll]
+    for (int j = -1; j <= 2; j++)
+    {
+        float wy = (j == -1) ? W0(frac_.y) :
+                    (j ==  0) ? W1(frac_.y) :
+                    (j ==  1) ? W2(frac_.y) :
+                                W3(frac_.y);
+
+        [unroll]
+        for (int i = -1; i <= 2; i++)
+        {
+            float wx = (i == -1) ? W0(frac_.x) :
+                        (i ==  0) ? W1(frac_.x) :
+                        (i ==  1) ? W2(frac_.x) :
+                                    W3(frac_.x);
+
+            int2 sampleXY = clamp(baseXY + int2(i, j), int2(0, 0), int2(_SrcSize) - 1);
+            float w = wx * wy;
+            result += _Source[sampleXY] * w;
+            wSum += w;
+        }
+    }
+
+    _Output[id.xy] = (wSum > 0) ? result / wSum : result;
+}

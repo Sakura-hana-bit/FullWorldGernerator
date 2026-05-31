@@ -1,0 +1,167 @@
+#pragma kernel CSFillHeightmap
+
+cbuffer FillHeightmapParams
+{
+    int   _BlendMode;       // BlendMode enum value
+    float _Opacity;         // 0-1 blend opacity
+    int   _TextureType;     // 0: Height only, 1: HeightWithGrad
+    float _Invert;          // 0 or 1
+    float _HeightRemapMin;  // remap source height min
+    float _HeightRemapMax;  // remap source height max
+    float _HeightOffset;    // offset added after remap
+    float2 _Seed;
+    float _TextureResolution;
+};
+
+Texture2D<float4> _FillSourceMap;
+SamplerState sampler_FillSourceMap;
+
+Texture2D<float4> _HeightSlopeMap;
+SamplerState sampler_HeightSlopeMap;
+
+RWTexture2D<float4> _Output;
+
+Texture2D _Mask;
+
+// ---------------------------------------------------------------------------
+// Blend mode helpers (base = existing layer, blend = fill source)
+// ---------------------------------------------------------------------------
+
+float BlendNormal(float b, float l)     { return l; }
+float BlendMultiply(float b, float l)   { return b * l; }
+float BlendScreen(float b, float l)     { return 1.0 - (1.0 - b) * (1.0 - l); }
+float BlendOverlay(float b, float l)   { return b < 0.5 ? 2.0*b*l : 1.0 - 2.0*(1.0-b)*(1.0-l); }
+float BlendSoftLight(float b, float l)  { return l < 0.5 ? b - (1.0 - 2.0*l)*b*(1.0-b) : b + (2.0*l - 1.0)*(sqrt(b) - b); }
+float BlendHardLight(float b, float l)  { return l < 0.5 ? 2.0*b*l : 1.0 - 2.0*(1.0-b)*(1.0-l); }
+float BlendAdd(float b, float l)        { return b + l; }
+float BlendSubtract(float b, float l)   { return b - l; }
+float BlendDifference(float b, float l) { return abs(b - l); }
+float BlendDarken(float b, float l)     { return min(b, l); }
+float BlendLighten(float b, float l)    { return max(b, l); }
+float BlendColorBurn(float b, float l)  { return l <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / l); }
+float BlendColorDodge(float b, float l) { return l >= 1.0 ? 1.0 : min(1.0, b / (1.0 - l)); }
+
+float ApplyBlend(float baseVal, float blendVal)
+{
+    switch (_BlendMode)
+    {
+        case 0:  return BlendNormal(baseVal, blendVal);
+        case 1:  return BlendMultiply(baseVal, blendVal);
+        case 2:  return BlendScreen(baseVal, blendVal);
+        case 3:  return BlendOverlay(baseVal, blendVal);
+        case 4:  return BlendSoftLight(baseVal, blendVal);
+        case 5:  return BlendHardLight(baseVal, blendVal);
+        case 6:  return BlendAdd(baseVal, blendVal);
+        case 7:  return BlendSubtract(baseVal, blendVal);
+        case 8:  return BlendDifference(baseVal, blendVal);
+        case 9:  return BlendDarken(baseVal, blendVal);
+        case 10: return BlendLighten(baseVal, blendVal);
+        case 11: return BlendColorBurn(baseVal, blendVal);
+        case 12: return BlendColorDodge(baseVal, blendVal);
+        default: return blendVal;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetBrushDelta — smoothstep height + analytical gradient from mask
+//
+//  height = x^2 * (3 - 2x)           (smoothstep)
+//  gradient = 6 * x * (1-x) * grad_m  (analytical derivative of smoothstep
+//                                       w.r.t. pixel position via chain rule)
+// ---------------------------------------------------------------------------
+
+struct BrushDelta
+{
+    float height;   // smoothstep weight
+    float2 grad;    // analytical gradient in pixel space
+};
+
+BrushDelta GetBrushDelta(float maskC, float maskR, float maskL, float maskU, float maskD)
+{
+    float x = maskC;
+    float s = x * x * (3.0 - 2.0 * x);                     // smoothstep
+    float dsdm = 6.0 * x * (1.0 - x);                      // d(smoothstep)/d(mask)
+
+    // Mask spatial gradient in pixel space (central finite differences)
+    float2 maskGrad = float2(maskR - maskL, maskU - maskD)
+                    * 0.5 * _TextureResolution;
+
+    BrushDelta d;
+    d.height = s;
+    d.grad   = dsdm * maskGrad;                              // chain rule
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSFillHeightmap(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+    float texelSize = 1.0 / _TextureResolution;
+
+    // Sample source fill texture
+    float4 src = _FillSourceMap.SampleLevel(sampler_FillSourceMap, uv, 0.0);
+
+    // Sample current height / slope / packed data map
+    float4 current = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0);
+
+    // Extract source height
+    float srcHeight = src.r;
+
+    // Invert if needed
+    if (_Invert > 0.5)
+        srcHeight = 1.0 - srcHeight;
+
+    // Remap height range
+    srcHeight = _HeightRemapMin + srcHeight * (_HeightRemapMax - _HeightRemapMin);
+
+    // Apply height offset
+    srcHeight += _HeightOffset;
+
+    // Blend height
+    float blendedHeight = ApplyBlend(current.x, srcHeight);
+
+    // Apply opacity
+    float finalHeight = lerp(current.x, blendedHeight, _Opacity);
+
+    // Source slopes (for HeightWithGrad mode)
+    float srcSlopeX = 0.0;
+    float srcSlopeY = 0.0;
+    if (_TextureType == 1) // HeightWithGrad
+    {
+        srcSlopeX = src.g;
+        srcSlopeY = src.b;
+    }
+
+    // Sample mask at current and neighboring pixels for gradient computation
+    float maskC = _Mask.SampleLevel(sampler_FillSourceMap, uv, 0.0).r;
+    float maskR = _Mask.SampleLevel(sampler_FillSourceMap, uv + float2(texelSize, 0.0), 0.0).r;
+    float maskL = _Mask.SampleLevel(sampler_FillSourceMap, uv - float2(texelSize, 0.0), 0.0).r;
+    float maskU = _Mask.SampleLevel(sampler_FillSourceMap, uv + float2(0.0, texelSize), 0.0).r;
+    float maskD = _Mask.SampleLevel(sampler_FillSourceMap, uv - float2(0.0, texelSize), 0.0).r;
+
+    // Compute brush delta (smoothstep height + analytical gradient)
+    BrushDelta brush = GetBrushDelta(maskC, maskR, maskL, maskU, maskD);
+
+    // Height blending with smoothstep curve
+    float newHeight = lerp(current.x, finalHeight, brush.height);
+
+    // Slopes from analytical gradient:
+    //   dh/dpixel = (1-s)*current_slope + s*src_slope + (finalHeight-current.x)*ds/dpixel
+    float slopeX = (1.0 - brush.height) * current.y
+                 + brush.height * srcSlopeX
+                 + (finalHeight - current.x) * brush.grad.x;
+    float slopeY = (1.0 - brush.height) * current.z
+                 + brush.height * srcSlopeY
+                 + (finalHeight - current.x) * brush.grad.y;
+
+    // Preserve packed A channel from previous layers (erosion data, ridge map, trees, etc.)
+    _Output[id.xy] = float4(newHeight, slopeX, slopeY, current.w);
+}

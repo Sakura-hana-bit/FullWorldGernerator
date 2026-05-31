@@ -1,0 +1,117 @@
+#pragma kernel CSInit
+#pragma kernel CSUpdate
+
+struct Particle
+{
+    float3 position;
+    float  life;
+    float3 velocity;
+    float  seed;
+    float4 color;
+};
+
+RWStructuredBuffer<Particle> _Particles;
+uint   _ParticleCount;
+float  _Time;
+float  _DeltaTime;
+
+// ── Hash / noise helpers ─────────────────────────────────────────
+
+float hash(float n) { return frac(sin(n) * 43758.5453123); }
+
+float3 hash33(float3 p)
+{
+    p = float3(dot(p, float3(127.1, 311.7, 74.7)),
+               dot(p, float3(269.5, 183.3, 246.1)),
+               dot(p, float3(113.5, 271.9, 124.6)));
+    return -1.0 + 2.0 * frac(sin(p) * 43758.5453123);
+}
+
+// ── Initialization — spiral galaxy ────────────────────────────────
+
+[numthreads(256, 1, 1)]
+void CSInit(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount) return;
+
+    float t = (float)id.x / (float)_ParticleCount;
+
+    // Spiral arm distribution
+    float armCount   = 3.0;
+    float armIndex   = floor(hash(t * 7.33) * armCount);
+    float armAngle   = armIndex * 2.0 * 3.14159265 / armCount;
+
+    // Distance from center — biased toward inner regions
+    float r = pow(hash(t * 13.37), 0.5) * 8.0;
+
+    // Spiral twist increases with radius
+    float twist = r * 0.8;
+    float angle = armAngle + twist;
+
+    // Scatter — tighter near center, wider at edges
+    float scatter = 0.3 + r * 0.06;
+    float ox = (hash(t * 31.71) - 0.5) * scatter;
+    float oz = (hash(t * 47.33) - 0.5) * scatter;
+    float oy = (hash(t * 59.17) - 0.5) * scatter * 0.15; // Thin disk
+
+    float x = cos(angle) * r + ox;
+    float z = sin(angle) * r + oz;
+    float y = oy;
+
+    _Particles[id.x].position = float3(x, y, z);
+    _Particles[id.x].velocity = float3(0, 0, 0);
+    _Particles[id.x].life     = 1.0;
+    _Particles[id.x].seed     = t;
+
+    // Color: warm core → cool arms
+    float coreDist = length(float2(x, z));
+    float3 coreColor  = float3(1.0, 0.85, 0.5);   // Warm yellow
+    float3 midColor   = float3(0.5, 0.7, 1.0);    // Blue
+    float3 outerColor = float3(0.2, 0.3, 0.8);    // Deep blue
+
+    float3 c;
+    if (coreDist < 2.0)
+        c = lerp(coreColor, midColor, coreDist / 2.0);
+    else
+        c = lerp(midColor, outerColor, saturate((coreDist - 2.0) / 6.0));
+
+    float brightness = lerp(1.5, 0.6, coreDist / 8.0);
+    _Particles[id.x].color = float4(c * brightness, 1.0);
+}
+
+// ── Update — orbital motion + turbulence ──────────────────────────
+
+[numthreads(256, 1, 1)]
+void CSUpdate(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= _ParticleCount) return;
+
+    Particle p = _Particles[id.x];
+    float3 pos = p.position;
+
+    float dist = length(pos.xz);
+
+    // Orbital angular velocity (Keplerian-ish: faster near center)
+    float orbitSpeed = 1.5 / (dist + 0.3);
+    float angle = atan2(pos.z, pos.x) + orbitSpeed * _DeltaTime;
+
+    // Add slight radial oscillation
+    float breathe = sin(_Time * 0.5 + p.seed * 6.28) * 0.02;
+
+    pos.x = cos(angle) * (dist + breathe);
+    pos.z = sin(angle) * (dist + breathe);
+
+    // Turbulence
+    float3 turb = hash33(float3(pos.xz * 0.2, _Time * 0.3)) * 0.15;
+    pos += turb * _DeltaTime;
+
+    // Keep disk thin
+    pos.y *= 0.995;
+
+    _Particles[id.x].position = pos;
+
+    // Pulse brightness
+    float pulse = 0.7 + 0.3 * sin(_Time * 2.0 + p.seed * 6.28);
+    float alpha = pulse * saturate(1.0 - dist * 0.06);
+    _Particles[id.x].color.a = alpha;
+}

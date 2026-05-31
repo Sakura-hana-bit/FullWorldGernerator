@@ -1,0 +1,82 @@
+#pragma kernel CSClampHeight
+
+// ---------------------------------------------------------------------------
+// Two-stage height clamping:
+//
+//   Range   = [RangeMin, RangeMax]   absolute bounds (e.g. [0, 1])
+//   Scale   = [ScaleMin, ScaleMax]   preferred operating range (e.g. [0.1, 0.8])
+//
+// Heights inside Scale pass through unchanged.
+// Heights outside Scale but inside Range receive quadratic decay pulling them
+// toward the Scale boundary (secondary decay), ensuring the final value
+// always stays within Range.
+// ---------------------------------------------------------------------------
+
+cbuffer ClampParams
+{
+    float _HeightScaleMin;
+    float _HeightScaleMax;
+    float _HeightRangeMin;
+    float _HeightRangeMax;
+};
+
+Texture2D<float4> _HeightSlopeMapSrc;
+SamplerState sampler_HeightSlopeMapSrc;
+
+RWTexture2D<float4> _HeightSlopeMapOut;
+
+// ---------------------------------------------------------------------------
+// Quadratic overshoot decay
+//   d    = distance from Scale boundary (>= 0)
+//   room = available space from Scale boundary to Range boundary
+//
+// Maps [0, inf) -> [0, room) with diminishing returns.
+// Small overshoots are gently corrected; large overshoots are aggressively
+// pulled back so the result never exceeds Range.
+// ---------------------------------------------------------------------------
+float DecayOvershoot(float d, float room)
+{
+    if (room < 1e-6) return 0.0;
+    float t = d / (d + room);
+    return room * t;
+}
+
+// ---------------------------------------------------------------------------
+float ClampHeight(float h, float scaleMin, float scaleMax, float rangeMin, float rangeMax)
+{
+    // Inside Scale range — pass through (safety clamp to Range)
+    if (h >= scaleMin && h <= scaleMax)
+        return clamp(h, rangeMin, rangeMax);
+
+    // Below ScaleMin — quadratic decay toward ScaleMin, hard floor at RangeMin
+    if (h < scaleMin)
+    {
+        float d    = scaleMin - h;
+        float room = max(scaleMin - rangeMin, 0.0);
+        float att  = DecayOvershoot(d, room);
+        return max(scaleMin - att, rangeMin);
+    }
+
+    // Above ScaleMax — quadratic decay toward ScaleMax, hard ceiling at RangeMax
+    float d    = h - scaleMax;
+    float room = max(rangeMax - scaleMax, 0.0);
+    float att  = DecayOvershoot(d, room);
+    return min(scaleMax + att, rangeMax);
+}
+
+// ---------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void CSClampHeight(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _HeightSlopeMapOut.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float4 src = _HeightSlopeMapSrc.Load(int3(id.xy, 0));
+    float h = src.r * (_HeightScaleMax - _HeightScaleMin) ;
+
+    float clamped = ClampHeight(h, _HeightScaleMin, _HeightScaleMax,
+                                   _HeightRangeMin, _HeightRangeMax);
+
+    _HeightSlopeMapOut[id.xy] = float4((clamped ) / (_HeightScaleMax - _HeightScaleMin), src.g, src.b, src.a);
+}

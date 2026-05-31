@@ -1,0 +1,14 @@
+/.codely-cli
+/.vs
+/.codely
+.com-unity-codely.json
+.codelyignore
+*.csproj
+*.zip
+/Library
+/Temp
+/UserSettings
+/screenshots
+/obj
+/Logs
+*.sln

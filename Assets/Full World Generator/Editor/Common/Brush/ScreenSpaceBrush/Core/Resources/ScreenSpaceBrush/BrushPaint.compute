@@ -1,0 +1,120 @@
+// ScreenSpaceBrush GPU Paint Kernel
+// Supports Add, Erase, Smooth modes with bounding-box-optimized dispatch.
+// All modes preserve the existing alpha channel (RGB-only painting).
+
+#pragma kernel CSAdd
+#pragma kernel CSErase
+#pragma kernel CSSmooth
+
+// ── Brush parameters ──────────────────────────────────────────────────
+float2 _Center;         // UV center of the stamp (0-1)
+float _Radius;          // UV radius
+float _Hardness;        // 0-1, feather amount
+float _Opacity;         // 0-1, per-stamp strength
+float4 _Color;          // Brush color (Add mode)
+uint2 _TextureSize;     // Texture dimensions in pixels
+uint2 _BoundsOffset;    // Pixel offset of the dispatch bounding box
+
+// ── Textures ──────────────────────────────────────────────────────────
+RWTexture2D<float4> _Result;   // Read-write paint target
+Texture2D<float4>    _Source;  // Read-only original (Smooth mode)
+
+// ── Weight function (matches CPU BrushSettings.WeightAtNormalizedDistance) ──
+float ComputeWeight(float normalizedDist, float hardness)
+{
+    if (normalizedDist >= 1.0) return 0.0;
+    if (hardness >= 1.0) return 1.0;
+    if (normalizedDist <= hardness) return 1.0;
+    float t = (normalizedDist - hardness) / (1.0 - hardness);
+    return 1.0 - t;
+}
+
+// ── Add kernel ────────────────────────────────────────────────────────
+[numthreads(8, 8, 1)]
+void CSAdd(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixelPos = _BoundsOffset + id.xy;
+    if (pixelPos.x >= _TextureSize.x || pixelPos.y >= _TextureSize.y) return;
+
+    float2 uv = float2(pixelPos) / float2(_TextureSize);
+    float dist = distance(uv, _Center);
+    float normalizedDist = dist / _Radius;
+
+    if (normalizedDist >= 1.0) return;
+
+    float weight = ComputeWeight(normalizedDist, _Hardness);
+    float blend = weight * _Opacity * _Color.a;
+    float4 existing = _Result[pixelPos];
+    _Result[pixelPos] = float4(
+        lerp(existing.r, _Color.r, blend),
+        lerp(existing.g, _Color.g, blend),
+        lerp(existing.b, _Color.b, blend),
+        existing.a
+    );
+}
+
+// ── Erase kernel ──────────────────────────────────────────────────────
+// Erase drives toward zero (black), using _Opacity for blend strength.
+[numthreads(8, 8, 1)]
+void CSErase(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixelPos = _BoundsOffset + id.xy;
+    if (pixelPos.x >= _TextureSize.x || pixelPos.y >= _TextureSize.y) return;
+
+    float2 uv = float2(pixelPos) / float2(_TextureSize);
+    float dist = distance(uv, _Center);
+    float normalizedDist = dist / _Radius;
+
+    if (normalizedDist >= 1.0) return;
+
+    float blend = ComputeWeight(normalizedDist, _Hardness) * _Opacity;
+    float4 existing = _Result[pixelPos];
+    _Result[pixelPos] = float4(
+        lerp(existing.r, 0.0, blend),
+        lerp(existing.g, 0.0, blend),
+        lerp(existing.b, 0.0, blend),
+        existing.a
+    );
+}
+
+// ── Smooth kernel (3x3 box blur from _Source) ─────────────────────────
+[numthreads(8, 8, 1)]
+void CSSmooth(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixelPos = _BoundsOffset + id.xy;
+    if (pixelPos.x >= _TextureSize.x || pixelPos.y >= _TextureSize.y) return;
+
+    float2 uv = float2(pixelPos) / float2(_TextureSize);
+    float dist = distance(uv, _Center);
+    float normalizedDist = dist / _Radius;
+
+    if (normalizedDist >= 1.0) return;
+
+    float blend = ComputeWeight(normalizedDist, _Hardness) * _Opacity;
+    float4 existing = _Result[pixelPos];
+
+    // 3x3 box blur sampling from original (_Source)
+    float3 sum = float3(0, 0, 0);
+    float count = 0;
+    for (int ky = -1; ky <= 1; ky++)
+    {
+        for (int kx = -1; kx <= 1; kx++)
+        {
+            int2 samplePos = int2(pixelPos) + int2(kx, ky);
+            if (samplePos.x >= 0 && samplePos.x < _TextureSize.x &&
+                samplePos.y >= 0 && samplePos.y < _TextureSize.y)
+            {
+                sum += _Source[samplePos].rgb;
+                count += 1;
+            }
+        }
+    }
+
+    float3 blurred = count > 0 ? sum / count : existing.rgb;
+    _Result[pixelPos] = float4(
+        lerp(existing.r, blurred.r, blend),
+        lerp(existing.g, blurred.g, blend),
+        lerp(existing.b, blurred.b, blend),
+        existing.a
+    );
+}

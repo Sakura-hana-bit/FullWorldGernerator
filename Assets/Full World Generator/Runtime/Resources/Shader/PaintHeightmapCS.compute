@@ -1,0 +1,210 @@
+#pragma kernel CSPaintHeightmap
+
+cbuffer PaintHeightmapParams
+{
+    int   _BlendMode;
+    float _Opacity;
+    float _TargetHeight;
+    float _Invert;
+    float _TextureResolution;
+    float _MaskResolution;
+};
+
+Texture2D<float4> _HeightSlopeMap;
+SamplerState sampler_HeightSlopeMap;
+
+RWTexture2D<float4> _Output;
+
+Texture2D _Mask;
+SamplerState sampler_Mask;
+
+// ---------------------------------------------------------------------------
+// Blend mode helpers (base = existing height, blend = target height)
+// ---------------------------------------------------------------------------
+
+float BlendNormal(float b, float l)     { return l; }
+float BlendMultiply(float b, float l)   { return b * l; }
+float BlendScreen(float b, float l)     { return 1.0 - (1.0 - b) * (1.0 - l); }
+float BlendOverlay(float b, float l)   { return b < 0.5 ? 2.0*b*l : 1.0 - 2.0*(1.0-b)*(1.0-l); }
+float BlendSoftLight(float b, float l)  { return l < 0.5 ? b - (1.0 - 2.0*l)*b*(1.0-b) : b + (2.0*l - 1.0)*(sqrt(b) - b); }
+float BlendHardLight(float b, float l)  { return l < 0.5 ? 2.0*b*l : 1.0 - 2.0*(1.0-b)*(1.0-l); }
+float BlendAdd(float b, float l)        { return b + l; }
+float BlendSubtract(float b, float l)   { return b - l; }
+float BlendDifference(float b, float l) { return abs(b - l); }
+float BlendDarken(float b, float l)     { return min(b, l); }
+float BlendLighten(float b, float l)    { return max(b, l); }
+float BlendColorBurn(float b, float l)  { return l <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / l); }
+float BlendColorDodge(float b, float l) { return l >= 1.0 ? 1.0 : min(1.0, b / (1.0 - l)); }
+
+float ApplyBlend(float baseVal, float blendVal)
+{
+    switch (_BlendMode)
+    {
+        case 0:  return blendVal;                                                    // Overwrite
+        case 1:  return BlendNormal(baseVal, blendVal);
+        case 2:  return BlendMultiply(baseVal, blendVal);
+        case 3:  return BlendScreen(baseVal, blendVal);
+        case 4:  return BlendOverlay(baseVal, blendVal);
+        case 5:  return BlendSoftLight(baseVal, blendVal);
+        case 6:  return BlendHardLight(baseVal, blendVal);
+        case 7:  return BlendAdd(baseVal, blendVal);
+        case 8:  return BlendSubtract(baseVal, blendVal);
+        case 9:  return BlendDifference(baseVal, blendVal);
+        case 10: return BlendDarken(baseVal, blendVal);
+        case 11: return BlendLighten(baseVal, blendVal);
+        case 12: return BlendColorBurn(baseVal, blendVal);
+        case 13: return BlendColorDodge(baseVal, blendVal);
+        default: return blendVal;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// d(ApplyBlend)/d(base) — analytical gradient for non-Overwrite modes
+// ---------------------------------------------------------------------------
+
+float ComputeBlendDerivative(float b, float l)
+{
+    switch (_BlendMode)
+    {
+        case 0:  return 0.0;                                                     // Overwrite (unused, handled separately)
+        case 1:  return 0.0;                                                     // Normal: result = l
+        case 2:  return l;                                                        // Multiply
+        case 3:  return (1.0 - l);                                                // Screen
+        case 4:  return b < 0.5 ? 2.0*l : 2.0*(1.0-l);                          // Overlay
+        case 5:  return l < 0.5
+                        ? 1.0 - (1.0 - 2.0*l)*(1.0 - 2.0*b)
+                        : 1.0 + (2.0*l - 1.0)*(0.5/sqrt(max(b, 1e-6)) - 1.0);  // SoftLight (approx)
+        case 6:  return l < 0.5 ? 2.0*l : 2.0*(1.0-l);                          // HardLight
+        case 7:  return 1.0;                                                     // Add
+        case 8:  return 1.0;                                                     // Subtract
+        case 9:  return b >= l ? 1.0 : -1.0;                                     // Difference
+        case 10: return b <= l ? 1.0 : 0.0;                                      // Darken
+        case 11: return b >= l ? 1.0 : 0.0;                                      // Lighten
+        case 12: return l > 0.0 ? 1.0/l : 0.0;                                   // ColorBurn (approx)
+        case 13: return l < 1.0 ? 1.0/(1.0-l) : 0.0;                            // ColorDodge (approx)
+        default: return 0.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GetBrushDelta — smoothstep height + analytical gradient from mask
+// ---------------------------------------------------------------------------
+
+struct BrushDelta
+{
+    float height;
+    float2 grad;
+};
+
+BrushDelta GetBrushDelta(float maskC, float maskR1, float maskL1, float maskU1, float maskD1,
+                           float maskR2, float maskL2, float maskU2, float maskD2)
+{
+    float x = maskC;
+    float s = x * x * (3.0 - 2.0 * x);
+    float dsdm = 6.0 * x * (1.0 - x);
+
+    // 5-point central difference (O(h^4)) to smooth out residual
+    // quantization noise in the mask texture.
+    // f'(x) ≈ (-f(x+2h) + 8f(x+h) - 8f(x-h) + f(x-2h)) / (12h)
+    float2 maskGrad = float2(
+        (-maskR2 + 8.0 * maskR1 - 8.0 * maskL1 + maskL2),
+        (-maskU2 + 8.0 * maskU1 - 8.0 * maskD1 + maskD2)
+    ) / 12.0 * _MaskResolution;
+
+    BrushDelta d;
+    d.height = s;
+    d.grad   = dsdm * maskGrad;
+    return d;
+}
+
+// ---------------------------------------------------------------------------
+// Compute output height at a given UV (for Overwrite finite-difference)
+// ---------------------------------------------------------------------------
+
+float ComputeOutputHeight(float2 uv, float targetH)
+{
+    float4 cur = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0);
+    float blendedH = ApplyBlend(cur.x, targetH);
+    float finalH   = lerp(cur.x, blendedH, _Opacity);
+
+    float m = _Mask.SampleLevel(sampler_Mask, uv, 0.0).r;
+    float s = m * m * (3.0 - 2.0 * m);
+
+    return lerp(cur.x, finalH, s);
+}
+
+// ---------------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSPaintHeightmap(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+    float texelSize = 1.0 / _TextureResolution;
+
+    float4 current = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0);
+
+    float targetH = _TargetHeight;
+    if (_Invert > 0.5)
+        targetH = -targetH;
+
+    // ── Overwrite: finite-difference slope for smooth edges ──
+    if (_BlendMode == 0)
+    {
+        float hC = ComputeOutputHeight(uv, targetH);
+        float hR = ComputeOutputHeight(uv + float2(texelSize, 0), targetH);
+        float hL = ComputeOutputHeight(uv - float2(texelSize, 0), targetH);
+        float hU = ComputeOutputHeight(uv + float2(0, texelSize), targetH);
+        float hD = ComputeOutputHeight(uv - float2(0, texelSize), targetH);
+
+        float slopeX = (hR - hL) * 0.5 * _TextureResolution;
+        float slopeY = (hU - hD) * 0.5 * _TextureResolution;
+
+        _Output[id.xy] = float4(hC, slopeX, slopeY, current.w);
+        return;
+    }
+
+    // ── Other blend modes: analytical gradient ──
+    float blendedHeight = ApplyBlend(current.x, targetH);
+    float finalHeight = lerp(current.x, blendedHeight, _Opacity);
+
+    float dBlend = ComputeBlendDerivative(current.x, targetH);
+    float blendedSlopeX = dBlend * current.y;
+    float blendedSlopeY = dBlend * current.z;
+    float finalSlopeX = lerp(current.y, blendedSlopeX, _Opacity);
+    float finalSlopeY = lerp(current.z, blendedSlopeY, _Opacity);
+
+    // Sample mask neighbors using mask's own texel size so the finite
+    // difference approximates the true mask gradient regardless of
+    // any resolution mismatch between mask and heightmap.
+    // 5-point stencil: sample at ±1 and ±2 texels for O(h^4) gradient.
+    float mt = 1.0 / _MaskResolution;   // mask texel size
+    float maskC  = _Mask.SampleLevel(sampler_Mask, uv, 0.0).r;
+    float maskR1 = _Mask.SampleLevel(sampler_Mask, uv + float2(mt, 0.0), 0.0).r;
+    float maskL1 = _Mask.SampleLevel(sampler_Mask, uv - float2(mt, 0.0), 0.0).r;
+    float maskU1 = _Mask.SampleLevel(sampler_Mask, uv + float2(0.0, mt), 0.0).r;
+    float maskD1 = _Mask.SampleLevel(sampler_Mask, uv - float2(0.0, mt), 0.0).r;
+    float maskR2 = _Mask.SampleLevel(sampler_Mask, uv + float2(2.0*mt, 0.0), 0.0).r;
+    float maskL2 = _Mask.SampleLevel(sampler_Mask, uv - float2(2.0*mt, 0.0), 0.0).r;
+    float maskU2 = _Mask.SampleLevel(sampler_Mask, uv + float2(0.0, 2.0*mt), 0.0).r;
+    float maskD2 = _Mask.SampleLevel(sampler_Mask, uv - float2(0.0, 2.0*mt), 0.0).r;
+
+    BrushDelta brush = GetBrushDelta(maskC, maskR1, maskL1, maskU1, maskD1,
+                                               maskR2, maskL2, maskU2, maskD2);
+
+    float newHeight = lerp(current.x, finalHeight, brush.height);
+
+    float slopeX = (1.0 - brush.height) * current.y
+                 + brush.height * finalSlopeX
+                 + (finalHeight - current.x) * brush.grad.x;
+    float slopeY = (1.0 - brush.height) * current.z
+                 + brush.height * finalSlopeY
+                 + (finalHeight - current.x) * brush.grad.y;
+
+    _Output[id.xy] = float4(newHeight, slopeX, slopeY, current.w);
+}

@@ -1,0 +1,16 @@
+{
+    "name": "ScreenSpaceBrush.Demo",
+    "rootNamespace": "ScreenSpaceBrush",
+    "references": [
+        "ScreenSpaceBrush.Core"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

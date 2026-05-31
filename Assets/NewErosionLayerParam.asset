@@ -1,0 +1,32 @@
+%YAML 1.1
+%TAG !u! tag:yousandi.cn,2023:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 55d2c2c8d62cf5443b2623db46ca6186, type: 3}
+  m_Name: NewErosionLayerParam
+  m_EditorClassIdentifier: 
+  erosionScale: 0.4
+  erosionStrength: 0.22
+  erosionGullyWeight: 0.5
+  erosionDetail: 2
+  erosionRounding: {x: 0.02, y: 0.02, z: 320.12, w: 2}
+  erosionOnset: {x: 0.1, y: 1.56, z: 2.8, w: 1.5}
+  erosionAssumedSlope: {x: 2.04, y: 0.6}
+  erosionCellScale: 1
+  erosionNormalization: 0.7
+  erosionOctaves: 8
+  erosionLacunarity: 2
+  erosionGain: 0.5
+  erosionEnabled: 1
+  terrainHeightOffset: {x: 0, y: 0}
+  fadeTargetDivisor: 1
+  defaultHeight: 0.45
+  grassHeight: 0.465
+  waterHeight: 0.46

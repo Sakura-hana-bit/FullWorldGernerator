@@ -1,0 +1,211 @@
+#pragma kernel CSErosionDebug
+#pragma kernel CSErosion
+#pragma kernel CSGenerateHeightmap
+
+// -----------------------------------------------------------------------------
+// EROSION PARAMS — configured by the debug tool, not the library header
+// Must be declared before #include so the #define overrides take effect
+// before the library's own #ifndef defaults.
+// -----------------------------------------------------------------------------
+
+cbuffer ErosionDebug
+{
+    float _ErosionScale;         // Global Scale
+    float _ErosionStrength;      // Erosion Muilt
+    float _ErosionGullyWeight;   // scale of hight. artifical param
+    float _ErosionDetail;        // combi meask pow sharp : /|\ -> (|)
+
+
+    // smoothMask
+    float4 _ErosionRounding;     // x: ridge, y: crease, z: initial mult, w: octave mult
+    float4 _ErosionOnset;        // x: initial, y: octave, z: ridgeMap initial, w: ridgeMap octave
+
+
+    float2 _ErosionAssumedSlope; // x: assumed slope value, y: override amount
+    float _ErosionCellScale;     // guide cell scale,that divieing map into some areas 
+    float _ErosionNormalization; 
+    int _ErosionOctaves;         // Number of splits
+    float _ErosionLacunarity;    // freq mulit
+    float _ErosionGain;
+    float2 _TerrainHeightOffset; // x: offset, y: fade target blend
+    float _ErosionEnabled;
+
+    // additional param for Env.
+    float _DefaultHeight;
+    float _GrassHeight;
+    float _WaterHeight;
+
+    int _DebugMode;             // 0:eroded height  1:ridge map  2:trees  3:debug/fadeTarget  4:erosion delta  5:original height
+
+    // Heightmap generation (FractalNoise) params
+    float _HeightFrequency;
+    int _HeightOctaves;
+    float _HeightLacunarity;
+    float _HeightGain;
+    float _HeightAmp;
+    float _HeightFunctionScale;
+    float _HeightScale;
+    float _FadeTargetDivisor;
+
+    // Seed offset for noise randomization
+    float2 _Seed;
+};
+
+// Override the library defaults before including — the #ifndef guards in the
+// library will see these are already defined and skip their own defaults.
+#define DEFAULT_HEIGHT _DefaultHeight
+#define GRASS_HEIGHT   _GrassHeight
+#define WATER_HEIGHT   _WaterHeight
+
+#include "Include/TerrainErosion.hlsl"
+
+// Both debug and production kernels read float4.
+// Debug only uses .xyz; production preserves .a (Pack4 data).
+Texture2D<float4> _HeightSlopeMap;
+SamplerState sampler_HeightSlopeMap;
+
+RWTexture2D<float4> _Output;
+
+Texture2D _Mask;
+SamplerState sampler_Mask;
+
+// Unpack a single channel from the packed float produced by Pack4.
+// Pack4 uses base-256 encoding: packed = b0/255 + b1/(255*256) + b2/(255*65536) + b3/(255*16777216)
+// To extract byte N: iteratively apply floor(frac(prev) * 256)
+float UnpackChannel(float packed, int channel) {
+    float p = packed * 255.0;
+    for (int i = 0; i < channel; i++)
+        p = frac(p) * 256.0;
+    return floor(p) / 255.0;
+}
+
+[numthreads(8, 8, 1)]
+void CSErosionDebug(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+
+    float3 heightSlope = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0).xyz;
+
+    float4 result = TerrainHeightmap(
+        uv,
+        heightSlope,
+        _ErosionScale,             
+        _ErosionStrength,
+        _ErosionGullyWeight,
+        _ErosionDetail,
+        _ErosionRounding,
+        _ErosionOnset,
+        _ErosionAssumedSlope,
+        _ErosionCellScale,
+        _ErosionNormalization,
+        _ErosionOctaves,
+        _ErosionLacunarity,
+        _ErosionGain,
+        _TerrainHeightOffset,
+        _ErosionEnabled,
+        _FadeTargetDivisor,
+        _Seed
+    );
+
+    // result = float4(eroded, erodedSlope.x, erodedSlope.y, packed)
+    float eroded      = result.x;
+    float packed       = result.w;
+    float erosionDelta = UnpackChannel(packed, 0) * 2.0 - 1.0;
+    float ridgeMapVal  = UnpackChannel(packed, 1) * 2.0 - 1.0;
+    float treesVal     = UnpackChannel(packed, 2) * 2.0 - 1.0;
+    float debugVal     = UnpackChannel(packed, 3) * 2.0 - 1.0;
+
+    float originalHeight = heightSlope.x;
+    float outVal = 0.0;
+
+    switch (_DebugMode)
+    {
+        case 0: outVal = eroded;                    break;  // eroded height
+        case 1: outVal = ridgeMapVal * 0.5 + 0.5;  break;  // ridge map
+        case 2: outVal = treesVal * 0.5 + 0.5;     break;  // trees
+        case 3: outVal = debugVal * 0.5 + 0.5;     break;  // debug / fadeTarget
+        case 4: outVal = erosionDelta * 0.5 + 0.5; break;  // erosion delta
+        case 5: outVal = originalHeight;            break;  // original height
+    }
+
+    _Output[id.xy] = float4(outVal, outVal, outVal, 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void CSErosion(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+
+    // Read full 4-channel input to preserve the packed A channel.
+    float4 inputHS = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0);
+    float3 heightSlope = inputHS.xyz;
+    float prevPacked = inputHS.a;
+
+    float4 result = TerrainHeightmap(
+        uv,
+        heightSlope,
+        _ErosionScale,             
+        _ErosionStrength,
+        _ErosionGullyWeight,
+        _ErosionDetail,
+        _ErosionRounding,
+        _ErosionOnset,
+        _ErosionAssumedSlope,
+        _ErosionCellScale,
+        _ErosionNormalization,
+        _ErosionOctaves,
+        _ErosionLacunarity,
+        _ErosionGain,
+        _TerrainHeightOffset,
+        _ErosionEnabled,
+        _FadeTargetDivisor,
+        _Seed
+    );
+
+    // When erosion has no effect (disabled or zero strength), preserve the
+    // previous A channel instead of overwriting with a freshly-computed Pack4
+    // that would destroy the accumulated ridgeMap/debug from prior layers.
+    bool erosionActive = (_ErosionEnabled > 0.5) && (_ErosionStrength > 0.001);
+    if (!erosionActive)
+        result.w = prevPacked;
+
+    // Apply mask to all 4 channels: lerp input → result by mask weight.
+    float mask = _Mask.SampleLevel(sampler_Mask, uv, 0.0).r;
+    result = lerp(float4(heightSlope, prevPacked), result, mask);
+
+    _Output[id.xy] = result;
+}
+
+// -----------------------------------------------------------------------------
+// HEIGHTMAP GENERATION — uses FractalNoise to produce base terrain + slopes
+// Output: float4(height, slopeX, slopeY, 0)
+// -----------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSGenerateHeightmap(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    _Output.GetDimensions(width, height);
+    if (id.x >= width || id.y >= height) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+
+    // FBM terrain height with analytical derivatives.
+    // FractalNoise returns float3(height, dheight/dx, dheight/dy).
+    float3 n = FractalNoise(uv * _HeightScale, _HeightFrequency, _HeightOctaves, _HeightLacunarity, _HeightGain, _Seed)
+        * _HeightAmp * float3(_HeightFunctionScale, 1.0, 1.0);
+
+    // Remap height from [-1,1] to [0,1] range (slopes unchanged).
+    n.x = n.x * 0.5 + 0.5;
+    float mask = _Mask.SampleLevel(sampler_Mask, uv, 0.0).r;
+    float3 result = lerp(0,n, mask);
+    _Output[id.xy] = float4(result, 0.0);
+}

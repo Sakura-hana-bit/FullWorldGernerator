@@ -1,0 +1,115 @@
+#pragma kernel CSBiomeMap
+
+// ---------------------------------------------------------------------------
+// Biome distribution thresholds (normalized [0,1] height space)
+// Layering: Water → Sand → Vegetation → Rock → Snow
+// Steep slopes override to rock regardless of height zone.
+// ---------------------------------------------------------------------------
+cbuffer BiomeParams
+{
+    float _WaterLine;
+    float _SandEnd;
+    float _VegetationEnd;
+    float _RockEnd;
+    float _SnowStart;
+    float _RockSlopeStart;
+    float _RockSlopeEnd;
+};
+
+Texture2D<float4> _HeightSlopeMap;   // R=height, G=slopeX, B=slopeY
+SamplerState sampler_HeightSlopeMap;
+
+RWTexture2D<float4> _BiomeMapOutput; // RGBA biome color
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+float Clamp01(float v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
+
+float Smoothstep(float edge0, float edge1, float x)
+{
+    float t = Clamp01((x - edge0) / (edge1 - edge0 + 1e-10));
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// ---------------------------------------------------------------------------
+// Biome color computation — mirrors C# ComputeBiomeColor exactly
+// ---------------------------------------------------------------------------
+
+float4 ComputeBiomeColor(float nh, float slope)
+{
+    // Biome palette
+    float4 waterDeep    = float4(0.10, 0.20, 0.50, 1.0);
+    float4 waterShallow = float4(0.30, 0.40, 0.70, 1.0);
+    float4 sand         = float4(0.76, 0.70, 0.50, 1.0);
+    float4 vegDark      = float4(0.20, 0.45, 0.10, 1.0);
+    float4 vegLight     = float4(0.35, 0.60, 0.20, 1.0);
+    float4 rockBrown    = float4(0.45, 0.35, 0.20, 1.0);
+    float4 rockGrey     = float4(0.55, 0.50, 0.45, 1.0);
+    float4 snowLight    = float4(0.85, 0.85, 0.90, 1.0);
+
+    // Height-based layering
+    float4 col;
+
+    if (nh < _WaterLine)
+    {
+        col = lerp(waterDeep, waterShallow, Clamp01(nh / _WaterLine));
+    }
+    else if (nh < _SandEnd)
+    {
+        float t = Clamp01((nh - _WaterLine) / (_SandEnd - _WaterLine));
+        col = lerp(waterShallow, sand, t);
+    }
+    else if (nh < _VegetationEnd)
+    {
+        float t = Clamp01((nh - _SandEnd) / (_VegetationEnd - _SandEnd));
+        float4 vegMix = lerp(vegDark, vegLight, t);
+        float sandFade = Smoothstep(_SandEnd, _SandEnd + 0.05, nh);
+        col = lerp(sand, vegMix, sandFade);
+    }
+    else if (nh < _RockEnd)
+    {
+        float t = Clamp01((nh - _VegetationEnd) / (_RockEnd - _VegetationEnd));
+        col = lerp(vegLight, rockGrey, t);
+    }
+    else if (nh < _SnowStart)
+    {
+        col = rockGrey;
+    }
+    else
+    {
+        float t = Clamp01((nh - _SnowStart) / (1.0 - _SnowStart));
+        col = lerp(rockGrey, snowLight, t);
+    }
+
+    // Steep slopes → rock override
+    float slopeBlend = Smoothstep(_RockSlopeStart, _RockSlopeEnd, slope);
+    col = lerp(col, rockBrown, slopeBlend * 0.6);
+
+    col.a = 1.0;
+    return col;
+}
+
+// ---------------------------------------------------------------------------
+// Kernel
+// ---------------------------------------------------------------------------
+
+[numthreads(8, 8, 1)]
+void CSBiomeMap(uint3 id : SV_DispatchThreadID)
+{
+    uint texWidth, texHeight;
+    _BiomeMapOutput.GetDimensions(texWidth, texHeight);
+    if (id.x >= texWidth || id.y >= texHeight) return;
+
+    float2 uv = (float2(id.xy) + 0.5) / float2(texWidth, texHeight);
+    float4 hs = _HeightSlopeMap.SampleLevel(sampler_HeightSlopeMap, uv, 0.0);
+
+    float h = hs.r;
+    float slopeX = hs.g;
+    float slopeY = hs.b;
+
+    float slope = Clamp01(sqrt(slopeX * slopeX + slopeY * slopeY));
+
+    _BiomeMapOutput[id.xy] = ComputeBiomeColor(h, slope);
+}

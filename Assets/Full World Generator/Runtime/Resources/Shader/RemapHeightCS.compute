@@ -1,0 +1,73 @@
+#pragma kernel CSRemapHeight
+
+// ---------------------------------------------------------------------------
+// Remap the height channel to [0,1] with quadratic falloff for out-of-range
+// values (typically caused by erosion layers pushing past the base range).
+//
+// _HeightRangeMin / _HeightRangeMax define the expected [0,1] mapping
+// envelope.  Values inside the envelope are passed through linearly;
+// values outside are squeezed back via quadratic decay so they never
+// produce flat-tops or flat-bottoms.
+// ---------------------------------------------------------------------------
+
+cbuffer RemapParams
+{
+    float _HeightRangeMin; // lower bound of expected range (e.g. 0.0)
+    float _HeightRangeMax; // upper bound of expected range (e.g. HeightScale)
+};
+
+Texture2D<float4> _HeightSlopeMap;   // R=height, G=slopeX, B=slopeY, A=packed
+SamplerState sampler_HeightSlopeMap;
+
+RWTexture2D<float4> _HeightSlopeMapOut;
+
+// ---------------------------------------------------------------------------
+// Quadratic remap: the R channel stores *world-space height* in meters.
+// The expected [0,1] envelope is defined by _HeightRangeMin / _HeightRangeMax.
+//
+// Values inside the envelope pass through linearly (mapped to [0,1]).
+// Values outside are squeezed back toward the envelope edge via quadratic
+// decay (x²), so they never produce flat-tops or flat-bottoms.
+//
+// The output R channel is always in [0,1] normalized space, ready for
+// TerrainData.SetHeights().
+// ---------------------------------------------------------------------------
+float RemapHeight(float h, float lo, float hi)
+{
+    float range = max(hi - lo, 1e-10);
+
+    // Normalized t in [0,1] envelope
+    float t = (h - lo) / range;
+
+    // Inside the envelope: linear pass-through → map to [0,1]
+    if (t >= 0.0 && t <= 1.0)
+        return t;
+
+    // Below lo: quadratic pull-up toward lo (never goes flat)
+    if (t < 0.0)
+    {
+        float d = -t;          // how far below lo (positive, in envelope units)
+        float q = d * d;        // quadratic decay
+        return d * (1.0 - q);  // return in [0, d) normalized, smoothly approaching 0
+    }
+
+    // Above hi: quadratic pull-down toward hi (never goes flat)
+    // t > 1.0
+    float d = t - 1.0;         // how far above hi (in envelope units)
+    float q = d * d;
+    return 1.0 - d * (1.0 - q); // return in (1.0 - d, 1.0], smoothed down
+}
+
+// ---------------------------------------------------------------------------
+// Kernel: apply RemapHeight to every pixel's R channel, preserving slope data
+// ---------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void CSRemapHeight(uint3 id : SV_DispatchThreadID)
+{
+    float4 src = _HeightSlopeMap.Load(int3(id.xy, 0));
+    float h = src.r;
+
+    float remapped = RemapHeight(h, _HeightRangeMin, _HeightRangeMax);
+
+    _HeightSlopeMapOut[id.xy] = float4(remapped, src.g, src.b, src.a);
+}
