@@ -9,6 +9,20 @@ using UnityEngine.UI;
 namespace FullWorld
 {
     /// <summary>
+    /// Biome zone identifiers matching the height/slope classification
+    /// in BiomeMapCS.compute. Used to map biome zones to TerrainLayers.
+    /// </summary>
+    public enum BiomeZone
+    {
+        Water       = 0,
+        Sand        = 1,
+        Vegetation  = 2,
+        Rock        = 3,
+        Snow        = 4,
+        Count       = 5
+    }
+
+    /// <summary>
     /// Bundles a single terrain layer's configuration so that reordering,
     /// duplication, and serialization always keep param / enable / mask in sync.
     /// </summary>
@@ -110,6 +124,8 @@ namespace FullWorld
 
         // Vegetation layers
         [SerializeField] private VegetationLayerEntry[] m_VegetationLayers = new VegetationLayerEntry[0];
+
+
 
         // ================================================================
         //  Public Access
@@ -402,23 +418,84 @@ namespace FullWorld
         }
 
         // ================================================================
+        //  Biome Zone Weight Computation (CPU, mirrors BiomeMapCS.compute)
+        // ================================================================
+
+        private static float SmoothstepCPU(float edge0, float edge1, float x)
+        {
+            float t = Mathf.Clamp01((x - edge0) / (edge1 - edge0 + 1e-10f));
+            return t * t * (3f - 2f * t);
+        }
+
+        /// <summary>
+        /// Computes per-biome zone weights from height and slope,
+        /// mirroring the GPU BiomeMapCS.compute classification logic.
+        /// weights[0..4] = Water, Sand, Vegetation, Rock, Snow.
+        /// </summary>
+        public static void ComputeBiomeWeights(
+            float h, float slope, BiomeDistribution biome, float[] weights)
+        {
+            for (int i = 0; i < (int)BiomeZone.Count; i++) weights[i] = 0f;
+
+            // Height-based zone assignment (mirrors BiomeMapCS.compute)
+            if (h < biome.waterLine)
+            {
+                weights[(int)BiomeZone.Water] = 1f;
+            }
+            else if (h < biome.sandEnd)
+            {
+                float t = Mathf.Clamp01((h - biome.waterLine)
+                    / (biome.sandEnd - biome.waterLine + 1e-10f));
+                weights[(int)BiomeZone.Water] = 1f - t;
+                weights[(int)BiomeZone.Sand]  = t;
+            }
+            else if (h < biome.vegetationEnd)
+            {
+                float sandFade = SmoothstepCPU(biome.sandEnd, biome.sandEnd + 0.05f, h);
+                weights[(int)BiomeZone.Sand]       = 1f - sandFade;
+                weights[(int)BiomeZone.Vegetation] = sandFade;
+            }
+            else if (h < biome.snowStart)
+            {
+                float t = Mathf.Clamp01((h - biome.vegetationEnd)
+                    / (biome.snowStart - biome.vegetationEnd + 1e-10f));
+                weights[(int)BiomeZone.Vegetation] = 1f - t;
+                weights[(int)BiomeZone.Rock]        = t;
+            }
+            else
+            {
+                float t = Mathf.Clamp01((h - biome.snowStart)
+                    / (1f - biome.snowStart + 1e-10f));
+                weights[(int)BiomeZone.Rock] = 1f - t;
+                weights[(int)BiomeZone.Snow] = t;
+            }
+
+            // Slope override: blend toward rock (mirrors lerp(col, rockBrown, slopeBlend * 0.6))
+            float sf = SmoothstepCPU(biome.rockSlopeStart, biome.rockSlopeEnd, slope) * 0.6f;
+            float wRock = weights[(int)BiomeZone.Rock];
+            weights[(int)BiomeZone.Rock]        = wRock + sf * (1f - wRock);
+            weights[(int)BiomeZone.Water]      *= (1f - sf);
+            weights[(int)BiomeZone.Sand]       *= (1f - sf);
+            weights[(int)BiomeZone.Vegetation] *= (1f - sf);
+            weights[(int)BiomeZone.Snow]       *= (1f - sf);
+        }
+
+        // ================================================================
         //  Unity Terrain Production (Runtime)
         // ================================================================
 
         /// <summary>
         /// Reads back the HeightSlopeMap from GPU and writes the height data
         /// into a <see cref="TerrainData"/> (and creates/updates a Terrain
-        /// component). Also sets the alphamap from BiomeMap for visual
-        /// biome coloring. Called automatically after <see cref="GenerateWorkflow"/>
+        /// component). Automatically creates TerrainLayers for each biome
+        /// zone and computes the alphamap from height/slope data.
+        /// Called automatically after <see cref="GenerateWorkflow"/>
         /// completes.
         /// </summary>
         public void GenerateTerrain()
         {
             if (heightSlopeMap == null)
             {
-                //Debug.LogWarning("[FullWorldTerrain] HeightSlopeMap not ready, skipping terrain generation.");
-                //return;
-
                 GenerateWorkflow();
             }
 
@@ -437,7 +514,7 @@ namespace FullWorld
             EnsureTerrainObject();
 
             // ---- TerrainData setup ----
-            int heightmapRes = resolution; // TerrainData requires power-of-two+1 internally, but we can use custom
+            int heightmapRes = resolution;
             float extentX = m_bounds.size.sqrMagnitude > 1e-6f ? m_bounds.size.x : m_MeshSizeX;
             float extentZ = m_bounds.size.sqrMagnitude > 1e-6f ? m_bounds.size.z : m_MeshSizeZ;
 
@@ -465,59 +542,102 @@ namespace FullWorld
             }
             m_TerrainData.SetHeights(0, 0, heights);
 
-            // ---- Alphamap: biome coloring from BiomeMap ----
-            if (biomeMap != null)
+            // ---- Alphamap: biome zone weights from height/slope ----
+            int biomeCount = (int)BiomeZone.Count;
+            int alphaRes = heightmapRes;
+
+            // Automatically create TerrainLayers for each biome zone
+            var terrainLayers = CreateBiomeTerrainLayers();
+            m_TerrainData.terrainLayers = terrainLayers;
+
+            // Set alphamap resolution
+            m_TerrainData.alphamapResolution = alphaRes;
+
+            // Compute biome zone weights for each pixel
+            float[,,] splat = new float[alphaRes, alphaRes, biomeCount];
+            float[] weights = new float[biomeCount];
+
+            for (int y = 0; y < alphaRes; y++)
             {
-                int alphaRes = Mathf.Min(heightmapRes, biomeMap.width);
-
-                // Ensure splat prototypes exist before calling SetAlphamaps
-                int splatCount = 4;
-                var prototypes = m_TerrainData.terrainLayers;
-                if (prototypes == null || prototypes.Length < splatCount)
+                for (int x = 0; x < alphaRes; x++)
                 {
-                    var newProtos = new TerrainLayer[splatCount];
-                    for (int i = 0; i < splatCount; i++)
-                    {
-                        newProtos[i] = new TerrainLayer();
-                        newProtos[i].diffuseTexture = null; // default white
-                    }
-                    m_TerrainData.terrainLayers = newProtos;
+                    int idx = y * resolution + x;
+                    float h = heightPixels[idx].r;
+                    float slopeX = heightPixels[idx].g;
+                    float slopeY = heightPixels[idx].b;
+                    float slope = Mathf.Clamp01(Mathf.Sqrt(slopeX * slopeX + slopeY * slopeY));
+
+                    ComputeBiomeWeights(h, slope, m_Biome, weights);
+
+                    for (int b = 0; b < biomeCount; b++)
+                        splat[y, x, b] = weights[b];
                 }
-
-                // Set alphamap resolution to match our data size
-                m_TerrainData.alphamapResolution = alphaRes;
-
-                // GPU readback of BiomeMap
-                RenderTexture.active = biomeMap;
-                var biomeTex = new Texture2D(alphaRes, alphaRes, TextureFormat.RGBAFloat, false, true);
-                biomeTex.ReadPixels(new Rect(0, 0, alphaRes, alphaRes), 0, 0);
-                biomeTex.Apply();
-                var biomePixels = biomeTex.GetPixels();
-                RenderTexture.active = prevRT;
-                DestroyImmediate(biomeTex);
-
-                float[,,] splat = new float[alphaRes, alphaRes, splatCount];
-                for (int y = 0; y < alphaRes; y++)
-                {
-                    for (int x = 0; x < alphaRes; x++)
-                    {
-                        int idx = y * alphaRes + x;
-                        Color c = biomePixels[idx];
-                        float total = c.r + c.g + c.b + c.a + 1e-6f;
-                        splat[y, x, 0] = c.r / total; // water
-                        splat[y, x, 1] = c.g / total; // sand
-                        splat[y, x, 2] = c.b / total; // vegetation
-                        splat[y, x, 3] = c.a / total; // rock/snow
-                    }
-                }
-                m_TerrainData.SetAlphamaps(0, 0, splat);
             }
+            m_TerrainData.SetAlphamaps(0, 0, splat);
 
             // ---- Assign to Terrain component ----
             m_Terrain.terrainData = m_TerrainData;
+            EnsureTerrainMaterial();
             m_Terrain.materialTemplate = m_TerrainMaterial;
 
             DestroyImmediate(heightTex);
+        }
+
+        /// <summary>
+        /// Ensures a terrain material exists. If none was assigned externally,
+        /// creates one using the HDRP TerrainLit shader automatically.
+        /// </summary>
+        private void EnsureTerrainMaterial()
+        {
+            if (m_TerrainMaterial != null) return;
+
+            var shader = Shader.Find("HDRP/TerrainLit");
+            if (shader != null)
+            {
+                m_TerrainMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+            }
+            else
+            {
+                // Fallback to built-in terrain standard
+                shader = Shader.Find("Nature/Terrain/Standard");
+                if (shader != null)
+                    m_TerrainMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+            }
+        }
+
+        /// <summary>
+        /// Creates a TerrainLayer for each biome zone with an auto-generated
+        /// diffuse texture that visually represents the biome (Water=blue,
+        /// Sand=yellow, Vegetation=green, Rock=grey, Snow=white).
+        /// </summary>
+        private TerrainLayer[] CreateBiomeTerrainLayers()
+        {
+            int biomeCount = (int)BiomeZone.Count;
+            var result = new TerrainLayer[biomeCount];
+
+            Color[] biomeColors = new Color[]
+            {
+                new Color(0.10f, 0.20f, 0.50f, 1f),  // Water
+                new Color(0.76f, 0.70f, 0.50f, 1f),  // Sand
+                new Color(0.20f, 0.45f, 0.10f, 1f),  // Vegetation
+                new Color(0.55f, 0.50f, 0.45f, 1f),  // Rock
+                new Color(0.85f, 0.85f, 0.90f, 1f),  // Snow
+            };
+
+            for (int i = 0; i < biomeCount; i++)
+            {
+                var layer = new TerrainLayer();
+                var tex = new Texture2D(4, 4, TextureFormat.RGBA32, false, true);
+                var pixels = new Color[16];
+                for (int p = 0; p < pixels.Length; p++)
+                    pixels[p] = biomeColors[i];
+                tex.SetPixels(pixels);
+                tex.Apply(true);
+                layer.diffuseTexture = tex;
+                result[i] = layer;
+            }
+
+            return result;
         }
 
         private void EnsureTerrainObject()
@@ -529,7 +649,6 @@ namespace FullWorld
 
             var go = new GameObject(kTerrainObjectName);
             m_Terrain = go.AddComponent<Terrain>();
-            m_Terrain.materialTemplate = m_TerrainMaterial;
         }
 
         /// <summary>
