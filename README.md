@@ -6,6 +6,22 @@ And you can run it in real time!!!
 
 ---
 
+## 🎬 Preview
+
+https://github.com/user-attachments/assets/preview1.mp4
+
+> **Terrain Lighting** — Real-time light variation across the generated terrain
+
+https://github.com/user-attachments/assets/preview2.mp4
+
+> **Terrain Overview** — Full landscape traversal of the procedurally generated world
+
+![Terrain Editing Tools](preview/Preview3.png)
+
+> **Editing Tools** — Layer management, biome control, and mask painting in the editor
+
+---
+
 ## ✨ Features
 
 - **GPU-Driven Heightmap Generation** — All terrain layers execute via `CommandBuffer` + Compute Shaders on the GPU; zero CPU bottleneck for height computation.
